@@ -2,5 +2,16 @@ __pycache__/
 *.py[cod]
 .vscode/
 .ipynb_checkpoints/
+.DS_Store
 *.dat
+*.larkcache
 *.csv
+
+# Local raw recordings
+0807华山grip flight/
+
+# Generated presentation artifacts
+*.pptx
+*.key
+*.pptx.inspect.ndjson
+.ppt_work_*/

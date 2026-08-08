@@ -30,9 +30,10 @@ class BCI2000Dat:
             self.source_channels = self._header_number(first_line, "SourceCh")
             self.statevector_len = self._header_number(first_line, "StatevectorLen")
             match = re.search(r"DataFormat=\s*(\w+)", first_line)
-            if not match or match.group(1) not in TYPE_INFO:
+            # Older BCI2000 files omit DataFormat and use int16 samples.
+            self.data_format = match.group(1) if match else "int16"
+            if self.data_format not in TYPE_INFO:
                 raise ValueError("Unsupported or missing BCI2000 DataFormat")
-            self.data_format = match.group(1)
             stream.seek(0)
             self.header = stream.read(self.header_len).decode("latin1", "replace")
 
@@ -83,7 +84,10 @@ class BCI2000Dat:
             return [f"Channel{i + 1}" for i in range(self.source_channels)]
         fields = match.group(1).split()
         count = int(fields[0])
-        return fields[1 : count + 1]
+        names = fields[1 : count + 1]
+        if len(names) != self.source_channels:
+            return [f"Channel{i + 1}" for i in range(self.source_channels)]
+        return names
 
     def _parse_state_definitions(self) -> dict[str, tuple[int, int, int]]:
         section = self.header.split("[ State Vector Definition ]", 1)[1]
