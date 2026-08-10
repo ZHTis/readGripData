@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .vscode/
+.history/
 .ipynb_checkpoints/
 .DS_Store
 *.dat
