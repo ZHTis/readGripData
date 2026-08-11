@@ -75,3 +75,35 @@ Collision 是握力经过游戏物理后的下游量；如果研究目标是 EEG
 它们作为输入特征。
 
 接口版本保存在 `data["interface_version"]`。后续修改字段语义时应同步升级版本。
+
+## 从接口生成建模特征池
+
+`grip_feature_pool.py` 直接接收上述 `flight_split`。为了给飞行开始处的特征保留
+Countdown 历史，推荐先读取完整 trial，再用特征池的 `mask_flight` 选择建模样本：
+
+```python
+from grip_feature_pool import build_grip_feature_pool
+
+trials = load_flight_trials(
+    eeg_path,
+    task_path,
+    segment="trial",
+)
+pool = build_grip_feature_pool(
+    trials,
+    recipe="literature_all",
+    window_ms=500,
+    step_ms=50,
+    causal=True,
+)
+
+X, y, groups = pool.as_sklearn(
+    target="force_normalized",
+    mask="mask_flight",
+)
+```
+
+`X` 已展开为 `windows × (channels × features)`，`groups` 是完整 trial 的
+`trial_key`，应交给 `GroupKFold` 等按组划分方法。`FeaturePool.save()` 可输出
+`manifest.json`、`features.npz`、`labels.parquet`、`windows.parquet` 和
+`feature_names.json`；Parquet 写入需要环境中安装 `pyarrow` 或 `fastparquet`。
