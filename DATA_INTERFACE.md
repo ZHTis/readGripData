@@ -91,7 +91,7 @@ trials = load_flight_trials(
 )
 pool = build_grip_feature_pool(
     trials,
-    recipe="literature_all",
+    recipe="expanded_multiscale",
     window_ms=500,
     step_ms=50,
     causal=True,
@@ -107,3 +107,27 @@ X, y, groups = pool.as_sklearn(
 `trial_key`，应交给 `GroupKFold` 等按组划分方法。`FeaturePool.save()` 可输出
 `manifest.json`、`features.npz`、`labels.parquet`、`windows.parquet` 和
 `feature_names.json`；Parquet 写入需要环境中安装 `pyarrow` 或 `fastparquet`。
+
+### 特征配方
+
+- `literature_all`：LMP 加文献中所有不重复频带功率；全部使用调用时指定的统一窗口。
+- `expanded_multiscale`：在文献频带上增加 slope、RMS、line length、Hjorth
+  activity/mobility/complexity、谱熵、谱质心，以及 beta/high-gamma burst 的
+  occupancy、rate 和 mean duration。
+
+`expanded_multiscale` 的所有特征共享同一输出/标签时刻，但历史长度不同：
+
+| 特征 | 历史窗口 |
+|---|---:|
+| LMP、0–4/0.5–4 Hz | 2000 ms |
+| slope、RMS、line length、Hjorth | 500 ms |
+| 4–60 Hz 功率 | 500 ms |
+| 60–300 Hz 功率 | 250 ms |
+| 谱熵、谱质心 | 1000 ms |
+| beta/high-gamma burst | 500 ms |
+
+burst 阈值按通道和 trial 独立计算，使用首个输出标签之前的历史，定义为
+`median + 2 × robust SD`；阈值作用于因果平滑后的功率包络（beta 100 ms、
+high-gamma 25 ms），避免把载波周期误判成大量短 burst，也不利用该 trial 后半段
+的信息。连接性、PAC 和协方差
+不是单通道特征，暂不混入 `window × channel × feature` 数组。

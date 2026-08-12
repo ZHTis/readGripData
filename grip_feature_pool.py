@@ -2,10 +2,11 @@
 
 This module consumes one or more ``flight_split`` dictionaries returned by
 ``grip_data_interface.py``.  It performs configurable re-referencing, notch
-filtering, causal/offline band filtering, historical windowing, LMP and band
-power extraction, and label generation.  The resulting :class:`FeaturePool`
-is independent of the original BCI2000 files and can be handed directly to
-downstream modelling code.
+filtering, causal/offline band filtering, historical windowing, time-domain,
+band-power, spectral-shape and oscillatory-burst extraction, and label
+generation.  The resulting :class:`FeaturePool` is independent of the
+original BCI2000 files and can be handed directly to downstream modelling
+code.
 
 The named recipes reproduce the *frequency-band definitions* summarized in
 the project literature review.  They are not claims of exact paper
@@ -27,7 +28,28 @@ import pandas as pd
 from scipy.signal import butter, iirnotch, sosfilt, sosfilt_zi, sosfiltfilt, tf2sos
 
 
-FEATURE_INTERFACE_VERSION = "1.0"
+FEATURE_INTERFACE_VERSION = "1.1"
+
+TIME_DOMAIN_FEATURES = (
+    "lmp",
+    "slope",
+    "rms",
+    "line_length",
+    "hjorth_activity",
+    "hjorth_mobility",
+    "hjorth_complexity",
+)
+SPECTRAL_SHAPE_FEATURES = ("spectral_entropy", "spectral_centroid")
+SPECTRAL_SHAPE_BANDS_HZ = (
+    (0.5, 4.0),
+    (4.0, 8.0),
+    (8.0, 13.0),
+    (13.0, 30.0),
+    (30.0, 60.0),
+    (60.0, 150.0),
+    (150.0, 300.0),
+)
+BURST_METRICS = ("occupancy", "rate", "mean_duration")
 
 # Frequency bands are kept study-specific on purpose.  Overlapping bands are
 # useful for direct feature-family ablations and regularized models.
@@ -87,6 +109,32 @@ def _literature_union() -> tuple[tuple[float, float], ...]:
 FEATURE_RECIPES["literature_all"] = {
     "lmp": True,
     "bands_hz": _literature_union(),
+}
+
+# A practical union for the present dataset.  All features end at the same
+# feature time, but slower features use longer history than fast activity.
+# This keeps X as window x channel x feature while respecting distinct time
+# scales.  Connectivity/PAC are intentionally separate future interfaces
+# because their natural axis is channel-pair rather than channel.
+FEATURE_RECIPES["expanded_multiscale"] = {
+    "lmp": False,
+    "bands_hz": _literature_union(),
+    "time_features": TIME_DOMAIN_FEATURES,
+    "spectral_features": SPECTRAL_SHAPE_FEATURES,
+    "spectral_shape_bands_hz": SPECTRAL_SHAPE_BANDS_HZ,
+    "burst_bands": (
+        {"name": "beta", "low_hz": 13.0, "high_hz": 30.0, "envelope_ms": 100.0},
+        {"name": "high_gamma", "low_hz": 70.0, "high_hz": 150.0, "envelope_ms": 25.0},
+    ),
+    "window_ms": {
+        "lmp": 2000.0,
+        "time_domain": 500.0,
+        "low_frequency": 2000.0,
+        "mid_frequency": 500.0,
+        "high_frequency": 250.0,
+        "spectral_shape": 1000.0,
+        "burst": 500.0,
+    },
 }
 
 
@@ -348,6 +396,133 @@ def _window_means(values: np.ndarray, starts: np.ndarray, stops: np.ndarray) -> 
     return (totals / (stops - starts)[np.newaxis, :]).T
 
 
+def _window_sums(values: np.ndarray, starts: np.ndarray, stops: np.ndarray) -> np.ndarray:
+    cumulative = np.concatenate(
+        [np.zeros((values.shape[0], 1), dtype=np.float64),
+         np.cumsum(values, axis=-1, dtype=np.float64)],
+        axis=-1,
+    )
+    return (cumulative[:, stops] - cumulative[:, starts]).T
+
+
+def _feature_starts(stops: np.ndarray, window_ms: float, sr: float) -> np.ndarray:
+    samples = int(round(float(window_ms) * sr / 1000.0))
+    if samples < 2:
+        raise ValueError(f"Feature window {window_ms:g} ms is too short at {sr:g} Hz")
+    starts = stops - samples
+    if np.any(starts < 0):
+        raise ValueError("Output windows do not contain enough history for every feature")
+    return starts
+
+
+def _window_variance(values: np.ndarray, starts: np.ndarray, stops: np.ndarray) -> np.ndarray:
+    mean = _window_means(values, starts, stops)
+    mean_square = _window_means(values * values, starts, stops)
+    return np.maximum(mean_square - mean * mean, 0.0)
+
+
+def _window_slopes(
+    values: np.ndarray, starts: np.ndarray, stops: np.ndarray, sr: float
+) -> np.ndarray:
+    """Least-squares linear slope in source-signal units per second."""
+    sample_index = np.arange(values.shape[1], dtype=np.float64)
+    cumulative_x = np.concatenate(
+        [np.zeros((values.shape[0], 1)), np.cumsum(values, axis=-1)], axis=-1
+    )
+    cumulative_ix = np.concatenate(
+        [np.zeros((values.shape[0], 1)),
+         np.cumsum(values * sample_index[np.newaxis, :], axis=-1)],
+        axis=-1,
+    )
+    sum_x = (cumulative_x[:, stops] - cumulative_x[:, starts]).T
+    sum_ix = (cumulative_ix[:, stops] - cumulative_ix[:, starts]).T
+    n = (stops - starts).astype(np.float64)
+    sum_i = (starts + stops - 1) * n / 2.0
+    sum_i2 = (
+        (stops - 1) * stops * (2 * stops - 1)
+        - (starts - 1) * starts * (2 * starts - 1)
+    ) / 6.0
+    denominator = n * sum_i2 - sum_i * sum_i
+    slope_per_sample = (n[:, None] * sum_ix - sum_i[:, None] * sum_x) / denominator[:, None]
+    return slope_per_sample * sr
+
+
+def _window_hjorth(
+    values: np.ndarray, starts: np.ndarray, stops: np.ndarray, sr: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    activity = _window_variance(values, starts, stops)
+    first = np.diff(values, axis=-1) * sr
+    second = np.diff(first, axis=-1) * sr
+    first_var = _window_variance(first, starts, stops - 1)
+    second_var = _window_variance(second, starts, stops - 2)
+    eps = np.finfo(np.float64).eps
+    mobility = np.sqrt(first_var / np.maximum(activity, eps))
+    derivative_mobility = np.sqrt(second_var / np.maximum(first_var, eps))
+    complexity = derivative_mobility / np.maximum(mobility, eps)
+    return activity, mobility, complexity
+
+
+def _causal_moving_mean(values: np.ndarray, samples: int) -> np.ndarray:
+    """Trailing moving mean with a progressively growing initial window."""
+    samples = int(samples)
+    if samples < 1:
+        raise ValueError("Moving-average length must be positive")
+    cumulative = np.concatenate(
+        [np.zeros((values.shape[0], 1), dtype=np.float64),
+         np.cumsum(values, axis=-1, dtype=np.float64)],
+        axis=-1,
+    )
+    stops = np.arange(1, values.shape[1] + 1)
+    starts = np.maximum(0, stops - samples)
+    return (
+        cumulative[:, stops] - cumulative[:, starts]
+    ) / (stops - starts)[None, :]
+
+
+def _burst_window_metrics(
+    band_power_samples: np.ndarray,
+    starts: np.ndarray,
+    stops: np.ndarray,
+    *,
+    sr: float,
+    baseline_stop: int,
+    threshold_mad: float,
+    envelope_ms: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return burst occupancy, rate and approximate mean duration.
+
+    The fixed per-channel threshold is median + ``threshold_mad`` robust SD,
+    estimated only from the history preceding the first output label.  This
+    prevents thresholds from looking ahead into later parts of a trial.
+    """
+    envelope_samples = max(1, int(round(envelope_ms * sr / 1000.0)))
+    envelope = _causal_moving_mean(band_power_samples, envelope_samples)
+    baseline = envelope[:, :baseline_stop]
+    median = np.median(baseline, axis=-1)
+    mad = np.median(np.abs(baseline - median[:, None]), axis=-1)
+    robust_sd = 1.4826 * mad
+    fallback = np.std(baseline, axis=-1)
+    scale = np.where(robust_sd > 0, robust_sd, fallback)
+    threshold = median + threshold_mad * np.maximum(scale, np.finfo(float).eps)
+    active = envelope > threshold[:, None]
+    occupancy = _window_means(active.astype(np.float64), starts, stops)
+
+    onset = active & np.concatenate(
+        [np.ones((active.shape[0], 1), dtype=bool), ~active[:, :-1]], axis=-1
+    )
+    onset_count = _window_sums(onset.astype(np.float64), starts, stops)
+    # A burst that started before the window still counts as one active burst.
+    carried = np.stack(
+        [active[:, start] & ~onset[:, start] for start in starts], axis=0
+    ).astype(float)
+    burst_count = onset_count + carried
+    duration_s = (stops - starts) / sr
+    rate = burst_count / duration_s[:, None]
+    mean_duration = occupancy * duration_s[:, None] / np.maximum(burst_count, 1.0)
+    mean_duration[occupancy == 0] = 0.0
+    return occupancy, rate, mean_duration
+
+
 def _format_frequency(value: float) -> str:
     text = f"{value:g}"
     return text.replace(".", "p")
@@ -365,10 +540,35 @@ def _recipe_sources(low_hz: float, high_hz: float) -> list[str]:
     ]
 
 
-def _feature_axis(recipe_name: str, log_power: bool) -> list[dict[str, Any]]:
+def _effective_windows_ms(recipe_name: str, default_window_ms: float) -> dict[str, float]:
+    configured = FEATURE_RECIPES[recipe_name].get("window_ms", {})
+    return {
+        "lmp": float(configured.get("lmp", default_window_ms)),
+        "time_domain": float(configured.get("time_domain", default_window_ms)),
+        "low_frequency": float(configured.get("low_frequency", default_window_ms)),
+        "mid_frequency": float(configured.get("mid_frequency", default_window_ms)),
+        "high_frequency": float(configured.get("high_frequency", default_window_ms)),
+        "spectral_shape": float(configured.get("spectral_shape", default_window_ms)),
+        "burst": float(configured.get("burst", default_window_ms)),
+    }
+
+
+def _band_window_ms(low_hz: float, windows_ms: Mapping[str, float]) -> float:
+    if low_hz < 4.0:
+        return windows_ms["low_frequency"]
+    if low_hz >= 60.0:
+        return windows_ms["high_frequency"]
+    return windows_ms["mid_frequency"]
+
+
+def _feature_axis(
+    recipe_name: str, log_power: bool, default_window_ms: float
+) -> list[dict[str, Any]]:
     recipe = FEATURE_RECIPES[recipe_name]
+    windows_ms = _effective_windows_ms(recipe_name, default_window_ms)
     axis: list[dict[str, Any]] = []
-    if recipe["lmp"]:
+    time_features = tuple(recipe.get("time_features", ()))
+    if recipe["lmp"] and "lmp" not in time_features:
         sources = [
             name for name, item in FEATURE_RECIPES.items()
             if name != "literature_all" and item["lmp"]
@@ -379,6 +579,25 @@ def _feature_axis(recipe_name: str, log_power: bool) -> list[dict[str, Any]]:
             "family": "time_domain",
             "unit": "source_signal_units",
             "recipe_sources": sources,
+            "window_ms": windows_ms["lmp"],
+        })
+    time_units = {
+        "lmp": "source_signal_units",
+        "slope": "source_signal_units/s",
+        "rms": "source_signal_units",
+        "line_length": "source_signal_units/s",
+        "hjorth_activity": "source_signal_units^2",
+        "hjorth_mobility": "Hz_like",
+        "hjorth_complexity": "dimensionless",
+    }
+    for name in time_features:
+        axis.append({
+            "index": len(axis),
+            "name": name,
+            "family": "time_domain",
+            "unit": time_units[name],
+            "recipe_sources": [],
+            "window_ms": windows_ms["lmp"] if name == "lmp" else windows_ms["time_domain"],
         })
     for low_hz, high_hz in recipe["bands_hz"]:
         axis.append({
@@ -389,7 +608,36 @@ def _feature_axis(recipe_name: str, log_power: bool) -> list[dict[str, Any]]:
             "high_hz": float(high_hz),
             "unit": "dB(source_signal_units^2)" if log_power else "source_signal_units^2",
             "recipe_sources": _recipe_sources(low_hz, high_hz),
+            "window_ms": _band_window_ms(float(low_hz), windows_ms),
         })
+    for name in recipe.get("spectral_features", ()):
+        axis.append({
+            "index": len(axis),
+            "name": name,
+            "family": "spectral_shape",
+            "unit": "dimensionless" if name == "spectral_entropy" else "Hz",
+            "recipe_sources": [],
+            "window_ms": windows_ms["spectral_shape"],
+            "bands_hz": [list(band) for band in recipe["spectral_shape_bands_hz"]],
+        })
+    burst_units = {
+        "occupancy": "fraction",
+        "rate": "bursts/s",
+        "mean_duration": "s",
+    }
+    for band in recipe.get("burst_bands", ()):
+        for metric in BURST_METRICS:
+            axis.append({
+                "index": len(axis),
+                "name": f"burst_{band['name']}_{metric}",
+                "family": "burst",
+                "unit": burst_units[metric],
+                "low_hz": float(band["low_hz"]),
+                "high_hz": float(band["high_hz"]),
+                "envelope_ms": float(band["envelope_ms"]),
+                "recipe_sources": [],
+                "window_ms": windows_ms["burst"],
+            })
     return axis
 
 
@@ -407,6 +655,8 @@ def _extract_trial_features(
     filter_order: int,
     log_power: bool,
     power_floor: float,
+    default_window_ms: float,
+    burst_threshold_mad: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     processed = _preprocess_signal(
         signal,
@@ -418,18 +668,109 @@ def _extract_trial_features(
     )
     feature_blocks: list[np.ndarray] = []
     recipe = FEATURE_RECIPES[recipe_name]
-    if recipe["lmp"]:
-        feature_blocks.append(_window_means(processed, starts, stops))
+    windows_ms = _effective_windows_ms(recipe_name, default_window_ms)
+    time_features = tuple(recipe.get("time_features", ()))
+    if recipe["lmp"] and "lmp" not in time_features:
+        local_starts = _feature_starts(stops, windows_ms["lmp"], sr)
+        feature_blocks.append(_window_means(processed, local_starts, stops))
+
+    if time_features:
+        time_starts = _feature_starts(stops, windows_ms["time_domain"], sr)
+        lmp_starts = _feature_starts(stops, windows_ms["lmp"], sr)
+        time_cache: dict[str, np.ndarray] = {
+            "lmp": _window_means(processed, lmp_starts, stops),
+            "slope": _window_slopes(processed, time_starts, stops, sr),
+            "rms": np.sqrt(_window_means(processed * processed, time_starts, stops)),
+            "line_length": _window_means(
+                np.abs(np.diff(processed, axis=-1)) * sr, time_starts, stops - 1
+            ),
+        }
+        activity, mobility, complexity = _window_hjorth(
+            processed, time_starts, stops, sr
+        )
+        time_cache.update({
+            "hjorth_activity": activity,
+            "hjorth_mobility": mobility,
+            "hjorth_complexity": complexity,
+        })
+        feature_blocks.extend(time_cache[name] for name in time_features)
+
+    filtered_power_samples: dict[tuple[float, float], np.ndarray] = {}
     for low_hz, high_hz in recipe["bands_hz"]:
         filtered = _apply_sos(
             processed,
             _band_sos(float(low_hz), float(high_hz), sr, filter_order),
             causal,
         )
-        power = _window_means(filtered * filtered, starts, stops)
+        power_samples = filtered * filtered
+        filtered_power_samples[(float(low_hz), float(high_hz))] = power_samples
+        local_starts = _feature_starts(
+            stops, _band_window_ms(float(low_hz), windows_ms), sr
+        )
+        power = _window_means(power_samples, local_starts, stops)
         if log_power:
             power = 10.0 * np.log10(np.maximum(power, power_floor))
         feature_blocks.append(power)
+
+    spectral_features = tuple(recipe.get("spectral_features", ()))
+    if spectral_features:
+        spectral_starts = _feature_starts(stops, windows_ms["spectral_shape"], sr)
+        spectral_powers: list[np.ndarray] = []
+        centers: list[float] = []
+        for low_hz, high_hz in recipe["spectral_shape_bands_hz"]:
+            band = (float(low_hz), float(high_hz))
+            power_samples = filtered_power_samples.get(band)
+            if power_samples is None:
+                filtered = _apply_sos(
+                    processed,
+                    _band_sos(*band, sr, filter_order),
+                    causal,
+                )
+                power_samples = filtered * filtered
+                filtered_power_samples[band] = power_samples
+            spectral_powers.append(
+                _window_means(power_samples, spectral_starts, stops)
+            )
+            centers.append((band[0] + band[1]) / 2.0)
+        power_stack = np.stack(spectral_powers, axis=-1)
+        total_power = np.maximum(power_stack.sum(axis=-1), power_floor)
+        proportions = power_stack / total_power[..., None]
+        entropy = -np.sum(
+            proportions * np.log(np.maximum(proportions, power_floor)), axis=-1
+        ) / np.log(len(spectral_powers))
+        centroid = np.sum(
+            proportions * np.asarray(centers)[None, None, :], axis=-1
+        )
+        spectral_cache = {
+            "spectral_entropy": entropy,
+            "spectral_centroid": centroid,
+        }
+        feature_blocks.extend(spectral_cache[name] for name in spectral_features)
+
+    burst_bands = tuple(recipe.get("burst_bands", ()))
+    if burst_bands:
+        burst_starts = _feature_starts(stops, windows_ms["burst"], sr)
+        baseline_stop = int(stops[0])
+        for band_config in burst_bands:
+            band = (float(band_config["low_hz"]), float(band_config["high_hz"]))
+            power_samples = filtered_power_samples.get(band)
+            if power_samples is None:
+                filtered = _apply_sos(
+                    processed,
+                    _band_sos(*band, sr, filter_order),
+                    causal,
+                )
+                power_samples = filtered * filtered
+                filtered_power_samples[band] = power_samples
+            feature_blocks.extend(_burst_window_metrics(
+                power_samples,
+                burst_starts,
+                stops,
+                sr=sr,
+                baseline_stop=baseline_stop,
+                threshold_mad=burst_threshold_mad,
+                envelope_ms=float(band_config["envelope_ms"]),
+            ))
     # Each block is windows x channels. Stack features last.
     return np.stack(feature_blocks, axis=-1).astype(np.float32), processed
 
@@ -470,6 +811,7 @@ def build_grip_feature_pool(
     log_power: bool = True,
     power_floor: float = 1e-20,
     force_active_threshold: float = 0.05,
+    burst_threshold_mad: float = 2.0,
     include_raw_windows: bool = False,
 ) -> FeaturePool:
     """Build a model-ready feature pool from one or more aligned recordings.
@@ -488,18 +830,22 @@ def build_grip_feature_pool(
         raise ValueError("filter_order must be at least 1")
     if notch_quality <= 0 or power_floor <= 0:
         raise ValueError("notch_quality and power_floor must be positive")
+    if burst_threshold_mad <= 0:
+        raise ValueError("burst_threshold_mad must be positive")
     if not 0 <= force_active_threshold <= 1:
         raise ValueError("force_active_threshold must be within 0..1")
 
     splits = _as_split_list(flight_splits)
     sr, channel_names = _validate_splits(splits)
-    window_samples = int(round(window_ms * sr / 1000.0))
+    effective_windows_ms = _effective_windows_ms(recipe, window_ms)
+    history_window_ms = max(effective_windows_ms.values())
+    window_samples = int(round(history_window_ms * sr / 1000.0))
     step_samples = int(round(step_ms * sr / 1000.0))
     lag_samples = int(round(label_lag_ms * sr / 1000.0))
     if window_samples < 2 or step_samples < 1:
         raise ValueError("window_ms/step_ms are too short at this sampling rate")
 
-    feature_axis = _feature_axis(recipe, log_power)
+    feature_axis = _feature_axis(recipe, log_power, window_ms)
     all_features: list[np.ndarray] = []
     all_raw_windows: list[np.ndarray] = []
     label_rows: list[dict[str, Any]] = []
@@ -541,6 +887,8 @@ def build_grip_feature_pool(
                 filter_order=filter_order,
                 log_power=log_power,
                 power_floor=power_floor,
+                default_window_ms=window_ms,
+                burst_threshold_mad=burst_threshold_mad,
             )
             all_features.append(trial_features)
             if include_raw_windows:
@@ -664,6 +1012,8 @@ def build_grip_feature_pool(
         "sampling_rate_hz": sr,
         "recipe": recipe,
         "window_ms": window_ms,
+        "history_window_ms": history_window_ms,
+        "feature_windows_ms": effective_windows_ms,
         "step_ms": step_ms,
         "label_lag_ms": label_lag_ms,
         "label_anchor": "window_stop_minus_1_plus_lag",
@@ -674,6 +1024,8 @@ def build_grip_feature_pool(
         "filter_order": filter_order,
         "log_power": log_power,
         "force_active_threshold": force_active_threshold,
+        "burst_threshold_mad": burst_threshold_mad,
+        "burst_threshold_baseline": "trial_history_before_first_output_label",
         "feature_shape": list(X.shape),
         "raw_windows_included": include_raw_windows,
         "target_names": [column for column in labels if column != "window_id"],

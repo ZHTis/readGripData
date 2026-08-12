@@ -96,6 +96,51 @@ class GripFeaturePoolTests(unittest.TestCase):
         self.assertIn((60.0, 200.0), bands)
         self.assertTrue(FEATURE_RECIPES["literature_all"]["lmp"])
 
+    def test_expanded_multiscale_features_and_metadata(self):
+        pool = build_grip_feature_pool(
+            self.make_split(),
+            recipe="expanded_multiscale",
+            window_ms=500,
+            step_ms=100,
+            notch_hz=(),
+        )
+        pool.validate()
+
+        self.assertEqual(pool.X.shape, (21, 2, 39))
+        self.assertTrue(np.isfinite(pool.X).all())
+        self.assertEqual(pool.manifest["history_window_ms"], 2000.0)
+        self.assertEqual(pool.manifest["feature_windows_ms"]["high_frequency"], 250.0)
+        self.assertEqual(pool.manifest["feature_windows_ms"]["spectral_shape"], 1000.0)
+
+        expected = {
+            "lmp", "slope", "rms", "line_length",
+            "hjorth_activity", "hjorth_mobility", "hjorth_complexity",
+            "spectral_entropy", "spectral_centroid",
+            "burst_beta_occupancy", "burst_beta_rate", "burst_beta_mean_duration",
+            "burst_high_gamma_occupancy", "burst_high_gamma_rate",
+            "burst_high_gamma_mean_duration",
+        }
+        self.assertTrue(expected.issubset(pool.feature_names))
+        feature_by_name = {
+            item["name"]: item for item in pool.feature_info["feature_axis"]
+        }
+        self.assertEqual(feature_by_name["lmp"]["window_ms"], 2000.0)
+        self.assertEqual(feature_by_name["bandpower_70_115Hz"]["window_ms"], 250.0)
+        self.assertEqual(feature_by_name["bandpower_0p5_4Hz"]["window_ms"], 2000.0)
+        self.assertEqual(feature_by_name["burst_beta_rate"]["envelope_ms"], 100.0)
+        self.assertEqual(feature_by_name["burst_high_gamma_rate"]["envelope_ms"], 25.0)
+
+        entropy = pool.X[:, :, pool.feature_names.index("spectral_entropy")]
+        beta_occupancy = pool.X[:, :, pool.feature_names.index("burst_beta_occupancy")]
+        self.assertTrue(np.all((entropy >= 0) & (entropy <= 1)))
+        self.assertTrue(np.all((beta_occupancy >= 0) & (beta_occupancy <= 1)))
+        beta_rate = pool.X[:, :, pool.feature_names.index("burst_beta_rate")]
+        high_gamma_rate = pool.X[:, :, pool.feature_names.index("burst_high_gamma_rate")]
+        self.assertTrue(np.all(beta_rate <= 20.0))
+        self.assertTrue(np.all(high_gamma_rate <= 80.0))
+        self.assertGreater(pool.X[:, :, pool.feature_names.index("rms")].mean(), 0)
+        self.assertGreater(pool.X[:, :, pool.feature_names.index("line_length")].mean(), 0)
+
     def test_non_trial_segment_is_recorded_as_warning(self):
         split = self.make_split()
         split["segment"] = "flight"
