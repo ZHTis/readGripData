@@ -3,6 +3,7 @@ __pycache__/
 .vscode/
 .history/
 .ipynb_checkpoints/
+.jupyter/
 .DS_Store
 *.dat
 *.larkcache
