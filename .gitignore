@@ -17,3 +17,6 @@ __pycache__/
 *.key
 *.pptx.inspect.ndjson
 .ppt_work_*/
+
+# Generated feature tables and analysis outputs
+feature_outputs/
