@@ -1,0 +1,176 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "R09 原始 EEG PSD 颜色与工频条带诊断",
+    "description": "基于 testS001R14 前 20 秒原始信号，对 0–300 Hz PSD 热图中的通道差异进行诊断。",
+    "generatedAt": "2026-08-18T17:22:21+08:00",
+    "charts": [
+      {
+        "id": "top_50hz_channels",
+        "title": "50 Hz 峰值最强的通道",
+        "subtitle": "峰值相对邻频背景的增量；testS001R14 前 20 秒",
+        "type": "bar",
+        "dataset": "top_50hz",
+        "sourceId": "psd_metrics_sql",
+        "encodings": {
+          "x": {"field": "channel", "type": "ordinal", "label": "通道"},
+          "y": {"field": "excess_db", "type": "quantitative", "label": "50 Hz 超额功率", "format": "number"}
+        },
+        "yAxisTitle": "相对邻频背景 (dB)",
+        "valueFormat": "number",
+        "layout": "full"
+      }
+    ],
+    "sources": [
+      {
+        "id": "r09_raw",
+        "label": "R09 Flight EEG 原始记录 testS001R14.dat",
+        "path": "testS001R14.dat"
+      },
+      {
+        "id": "psd_notebook",
+        "label": "R09 Flight EEG 对齐与 PSD notebook",
+        "path": "align_R09_flight_eeg_force.ipynb"
+      },
+      {
+        "id": "psd_metrics_sql",
+        "label": "逐通道 PSD 指标 SQLite 快照查询",
+        "path": "psd_metrics.sqlite",
+        "query": {
+          "engine": "sqlite",
+          "language": "sql",
+          "description": "从 Python 生成的逐通道 PSD 指标快照中选取 50 Hz 超额最高的 15 个通道。",
+          "sql": "SELECT channel, raw_channel_number, channel_group, ROUND(line_50_excess_db, 3) AS excess_db FROM psd_channel_metrics ORDER BY line_50_excess_db DESC LIMIT 15;",
+          "tables_used": ["psd_channel_metrics"],
+          "filters": ["前 20 秒原始信号", "非 EMPTY 通道", "按 50 Hz 邻频超额降序取前 15"]
+        }
+      }
+    ],
+    "blocks": [
+      {"id": "title", "type": "markdown", "body": "# R09 原始 EEG PSD 颜色与工频条带诊断"},
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "## 技术结论\n\n- **工频条带是真实的通道组差异，不只是颜色错觉。** 222 个非 EMPTY 通道中，57 个通道的 50 Hz 峰比邻频背景高出超过 6 dB；其中原始通道 203–254 的 46 个非 EMPTY 通道全部受影响，最强超额约 51.9 dB。\n- **最可能是采集 bank、参考/地或电极阻抗造成的局部工频耦合。** 强峰集中在连续硬件编号段，并覆盖第二组 EKG/EMG、Ear/Chin/Eye 与 H/I/N′ 电极；这不像均匀环境噪声。\n- **低频更亮主要是原始生物电信号的 1/f 谱形与慢漂移。** 颅内通道中，1–30 Hz 的每频点 PSD 中位数比 70–150 Hz 高 26.6 dB，约等于 450 倍功率密度。\n- **当前热图使用全局自动色标。** 每个通道没有单独归一化，所以亮度同时反映绝对功率、通道类型与极端工频峰；不能仅凭颜色判断某通道是否“更好”。"
+      },
+      {
+        "id": "line_finding",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "## 工频集中在连续通道段\n\n50 Hz 超额功率与通道总体标准差的相关仅为 **−0.15**，说明条带并不是因为这些通道整体振幅更大。相反，203–254 号段形成几乎整齐的受影响区块：同一段里的颅内电极和辅助通道都出现 40–52 dB 的窄带峰。最值得先检查的是这组通道共享的放大器 bank、参考、地线、接插件与阻抗记录。"
+      },
+      {"id": "line_chart", "type": "chart", "chartId": "top_50hz_channels", "layout": "full"},
+      {
+        "id": "line_interpretation",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "### 50 Hz 峰值最高的代表通道\n\n- H7_227（原始 227）：51.9 dB\n- H6_226（原始 226）：51.0 dB\n- H11_231（原始 231）：50.2 dB\n- H8_228（原始 228）：49.3 dB\n- H10_230（原始 230）：49.3 dB\n- H12_232（原始 232）：49.0 dB\n- N'6_248（原始 248）：48.6 dB\n- I5（原始 237）：48.5 dB\n\n这些通道都位于同一后部通道组。相对邻频背景的超额值可把窄带工频峰与宽带高噪声区分开；因此这里的亮线应视为实际窄带污染，而非仅由热图色阶产生。"
+      },
+      {
+        "id": "low_frequency_finding",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "## 低频亮度符合原始信号的谱形\n\nWelch 计算只做了每段常数去趋势，并未做高通、CAR 或 50 Hz 陷波。神经电活动通常随频率升高而功率下降；电极极化、基线漂移、运动与呼吸等慢成分会进一步抬高低频。颅内通道的低频–高频差中位数为 26.6 dB，而 DC 通道仅约 0.5 dB，证明颜色差异还混入了不同通道类型的传递特性。"
+      },
+      {
+        "id": "low_high_evidence",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "### 各通道类型的低频–高频差\n\n- 颅内 EEG：188 个通道，低频高出 26.6 dB\n- 辅助生理：18 个通道，低频高出 15.5 dB\n- DC：16 个通道，低频高出 0.5 dB\n\n颅内 EEG 的差值约对应 450 倍每频点功率密度，符合明显的 1/f 谱形；DC 通道的差值接近零，说明不能用同一色阶直接比较不同通道类型。"
+      },
+      {
+        "id": "color_scale_interpretation",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "## 全局色标放大了视觉反差\n\n当前 `imshow` 未设置 `vmin`/`vmax`，因而按整个 222×频率矩阵的最小值 −53.9 dB 和最大值 39.3 dB 自动映射。极端工频峰、低噪声 DC 通道和高低频的 1/f 落差共享同一个 93 dB 色域。结果是：亮色可表示低频生理功率，也可表示窄带工频污染；两者必须结合频率位置和邻频背景区分。"
+      },
+      {
+        "id": "harmonic_evidence",
+        "type": "markdown",
+        "sourceId": "r09_raw",
+        "body": "### 50 Hz 倍频峰统计\n\n- 50 Hz：57 个通道超过 6 dB，最大 51.9 dB\n- 100 Hz：49 个通道超过 6 dB，最大 18.9 dB\n- 150 Hz：55 个通道超过 6 dB，最大 37.1 dB\n- 200 Hz：25 个通道超过 6 dB，最大 7.1 dB\n- 250 Hz：55 个通道超过 6 dB，最大 30.4 dB\n- 300 Hz：47 个通道超过 6 dB，最大 8.6 dB\n\n倍频并非只出现在 50 Hz；但不同倍频的峰值强弱不同，仍以 50 Hz 主峰最突出。"
+      },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "sourceId": "psd_notebook",
+        "body": "## 范围与指标定义\n\n分析复现 notebook 的 PSD 设置：testS001R14 前 20 秒、采样率 2000 Hz、Welch `nperseg=4096`、频率分辨率约 0.488 Hz、逐通道常数去趋势，保留所有非 EMPTY 通道。工频超额定义为目标频率 ±0.75 Hz 内最大 PSD，减去距目标频率 2–5 Hz 的邻频 PSD 中位数。低频–高频差定义为 1–30 Hz 与 70–150 Hz 每频点 PSD 中位数之差，并排除倍频附近 ±2 Hz。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 局限与不确定性\n\n这是前 20 秒的描述性诊断，能确认频谱结构和通道集中性，但不能单凭 PSD 证明具体硬件故障。通道名到物理放大器 bank、参考电极和阻抗的映射未包含在记录中；要确认根因，还需要当天的接线图、参考/地配置和阻抗日志。辅助生理与 DC 通道不应和颅内 EEG 用同一质量阈值解释。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 建议下一步\n\n1. 先核对原始通道 203–254 是否共用同一放大器 bank、参考或接插件，并检查这组通道的阻抗与地线。\n2. PSD 质量图按通道类型分面，排除 DC 与辅助通道；同时增加“每通道减去自身频谱中位数”的相对 PSD 图，用于观察窄带峰。\n3. 保留当前原始 PSD 作为采集质量证据；若后续任务分析不希望去除工频，可至少把 50 Hz 峰值和邻频背景作为每通道质量指标，而不要仅依赖热图颜色。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 仍需确认的问题\n\n- 203–254 号段在硬件上是否属于同一设备或参考组？\n- 同一组通道在其他 Run 中是否重复出现相同 50 Hz 峰？\n- 当天是否保存了电极阻抗或参考/地连接记录？"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-18T17:22:21+08:00",
+    "status": "ready",
+    "datasets": {
+      "summary": [
+        {"strong_line_channels": 57, "affected_bank_channels": 46, "intracranial_low_high_gap_db": 26.56}
+      ],
+      "top_50hz": [
+        {"channel": "H7_227", "raw_channel_number": 227, "group": "intracranial", "excess_db": 51.923},
+        {"channel": "H6_226", "raw_channel_number": 226, "group": "intracranial", "excess_db": 51.006},
+        {"channel": "H11_231", "raw_channel_number": 231, "group": "intracranial", "excess_db": 50.245},
+        {"channel": "H8_228", "raw_channel_number": 228, "group": "intracranial", "excess_db": 49.272},
+        {"channel": "H10_230", "raw_channel_number": 230, "group": "intracranial", "excess_db": 49.259},
+        {"channel": "H12_232", "raw_channel_number": 232, "group": "intracranial", "excess_db": 48.957},
+        {"channel": "N'6_248", "raw_channel_number": 248, "group": "intracranial", "excess_db": 48.579},
+        {"channel": "I5", "raw_channel_number": 237, "group": "intracranial", "excess_db": 48.455},
+        {"channel": "I6", "raw_channel_number": 238, "group": "intracranial", "excess_db": 48.427},
+        {"channel": "Chin2", "raw_channel_number": 218, "group": "auxiliary", "excess_db": 48.338},
+        {"channel": "Eye2", "raw_channel_number": 220, "group": "auxiliary", "excess_db": 48.250},
+        {"channel": "Eye1", "raw_channel_number": 219, "group": "auxiliary", "excess_db": 48.182},
+        {"channel": "N'5_247", "raw_channel_number": 247, "group": "intracranial", "excess_db": 48.124},
+        {"channel": "Ear2", "raw_channel_number": 215, "group": "auxiliary", "excess_db": 48.029},
+        {"channel": "Chinz", "raw_channel_number": 216, "group": "auxiliary", "excess_db": 47.895}
+      ],
+      "group_low_high": [
+        {"group": "颅内 EEG", "channels": 188, "difference_db": 26.56},
+        {"group": "辅助生理", "channels": 18, "difference_db": 15.495},
+        {"group": "DC", "channels": 16, "difference_db": 0.468}
+      ],
+      "harmonics": [
+        {"frequency_hz": 50, "channels_over_3db": 62, "channels_over_6db": 57, "max_excess_db": 51.923},
+        {"frequency_hz": 100, "channels_over_3db": 51, "channels_over_6db": 49, "max_excess_db": 18.897},
+        {"frequency_hz": 150, "channels_over_3db": 71, "channels_over_6db": 55, "max_excess_db": 37.126},
+        {"frequency_hz": 200, "channels_over_3db": 70, "channels_over_6db": 25, "max_excess_db": 7.059},
+        {"frequency_hz": 250, "channels_over_3db": 116, "channels_over_6db": 55, "max_excess_db": 30.362},
+        {"frequency_hz": 300, "channels_over_3db": 69, "channels_over_6db": 47, "max_excess_db": 8.619}
+      ]
+    }
+  },
+  "sources": [
+    {"id": "r09_raw", "label": "R09 Flight EEG 原始记录 testS001R14.dat", "path": "testS001R14.dat"},
+    {"id": "psd_notebook", "label": "R09 Flight EEG 对齐与 PSD notebook", "path": "align_R09_flight_eeg_force.ipynb"},
+    {
+      "id": "psd_metrics_sql",
+      "label": "逐通道 PSD 指标 SQLite 快照查询",
+      "path": "psd_metrics.sqlite",
+      "query": {
+        "engine": "sqlite",
+        "language": "sql",
+        "description": "从 Python 生成的逐通道 PSD 指标快照中选取 50 Hz 超额最高的 15 个通道。",
+        "sql": "SELECT channel, raw_channel_number, channel_group, ROUND(line_50_excess_db, 3) AS excess_db FROM psd_channel_metrics ORDER BY line_50_excess_db DESC LIMIT 15;",
+        "tables_used": ["psd_channel_metrics"],
+        "filters": ["前 20 秒原始信号", "非 EMPTY 通道", "按 50 Hz 邻频超额降序取前 15"]
+      }
+    }
+  ]
+}
